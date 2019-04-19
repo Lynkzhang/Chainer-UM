@@ -1,3 +1,4 @@
+from __future__ import absolute_import
 import math
 import warnings
 
@@ -196,25 +197,37 @@ def numerical_grad(
         return y
 
     # An iteration on a single input displacement
-    def iterate_single_input(i_in, x, orig_x, i):
-        orig = orig_x[i]
+    def iterate_single_input(i_in, x, orig_x, x_ind):
+        orig = orig_x[x_ind]
         # `yss` holds a list of output arrays for each of 2 or 5 sampling
         # points.
         if detect_nondifferentiable:
             yss = [
-                eval_func(x, i, -eps * 1., orig),
-                eval_func(x, i, -eps * .5, orig),
+                eval_func(x, x_ind, -eps * 1., orig),
+                eval_func(x, x_ind, -eps * .5, orig),
                 ys0,
-                eval_func(x, i, +eps * .5, orig),
-                eval_func(x, i, +eps * 1., orig),
+                eval_func(x, x_ind, +eps * .5, orig),
+                eval_func(x, x_ind, +eps * 1., orig),
             ]
         else:
             yss = [
-                eval_func(x, i, -eps * 1, orig),
-                eval_func(x, i, +eps * 1, orig),
+                eval_func(x, x_ind, -eps * 1, orig),
+                eval_func(x, x_ind, +eps * 1, orig),
             ]
 
-        if detect_nondifferentiable:
+        assert all([
+            y is None
+            or (y.shape == yss[0][i].shape and y.dtype == yss[0][i].dtype)
+            for ys in yss
+            for i, y in enumerate(ys)])
+
+        # If all the outputs are 0-size, skip non-differentiable check.
+        if all([y is None or y.size == 0 for y in yss[0]]):
+            detect_nondifferentiable_ = False
+        else:
+            detect_nondifferentiable_ = detect_nondifferentiable
+
+        if detect_nondifferentiable_:
             # Detect non-differentiable point by quadratic fitting
 
             # Check for non-finite output.
@@ -237,7 +250,7 @@ def numerical_grad(
                     s.write('i_in: {}\n'.format(i_in))
                     s.write('i_out: {}\n'.format(i_out))
                     s.write('x: {}\n'.format(inputs[i_in]))
-                    s.write('index on x: {}\n'.format(i))
+                    s.write('index on x: {}\n'.format(x_ind))
                     s.write('eps: {}\n'.format(eps))
                     s.write('y[x-eps  ]: {}\n'.format(yss[0][i_out]))
                     s.write('y[x-eps/2]: {}\n'.format(yss[1][i_out]))
@@ -290,7 +303,7 @@ def numerical_grad(
                         s.write('i_in: {}\n'.format(i_in))
                         s.write('i_out: {}\n'.format(i_out))
                         s.write('x: {}\n'.format(inputs[i_in]))
-                        s.write('index on x: {}\n'.format(i))
+                        s.write('index on x: {}\n'.format(x_ind))
                         s.write('eps: {}\n'.format(eps))
                         s.write('diff_rtol: {}\n'.format(diff_rtol))
                         s.write('diff_atol: {}\n'.format(diff_atol))
@@ -330,10 +343,10 @@ def numerical_grad(
                 y1 = yss[1][i_out]
                 if gpu_:
                     numerical_grad_kernel_1(
-                        y1, y0, xp.asarray(gy), eps, gx[i])
+                        y1, y0, xp.asarray(gy), eps, gx[x_ind])
                 else:
                     dot = ((y1 - y0) * gy).sum()
-                    gx[i] = gx[i] + dot / (2 * eps)
+                    gx[x_ind] = gx[x_ind] + dot / (2 * eps)
             elif len(yss) == 5:  # 3rd order
                 y0 = yss[0][i_out]
                 y1 = yss[1][i_out]
@@ -341,11 +354,11 @@ def numerical_grad(
                 y3 = yss[4][i_out]
                 if gpu_:
                     numerical_grad_kernel_3(
-                        y3, y2, y1, y0, gy, eps, gx[i])
+                        y3, y2, y1, y0, gy, eps, gx[x_ind])
                 else:
                     num = -y3 + 8 * y2 - 8 * y1 + y0
                     dot = (num * gy).sum()
-                    gx[i] = gx[i] + dot / (6 * eps)
+                    gx[x_ind] = gx[x_ind] + dot / (6 * eps)
             else:
                 assert False
 
@@ -353,8 +366,8 @@ def numerical_grad(
     with configuration.using_config('type_check', False):
         for i_in, (x, gx) in enumerate(six.moves.zip(inputs, grads)):
             orig_x = x.copy()  # hold original value
-            for i in numpy.ndindex(x.shape):
-                iterate_single_input(i_in, x, orig_x, i)
+            for x_ind in numpy.ndindex(x.shape):
+                iterate_single_input(i_in, x, orig_x, x_ind)
 
     return [g.astype(x.dtype, copy=False)
             for g, x in six.moves.zip(grads, inputs)]
@@ -521,6 +534,7 @@ class _CheckBackward(object):
             f.write('gradients (numeric):  {}\n'.format(gx_numeric))
             f.write('gradients (backward): {}\n'.format(gx_backward))
             f.write('\n')
+            f.write('x: numeric gradient, y: backward gradient')
             f.write(str(e))
             raise AssertionError(f.getvalue())
 
@@ -957,16 +971,29 @@ def check_double_backward(func, x_data, y_grad, x_grad_grad, params=(),
         y.backward(enable_double_backprop=True)
 
         gxs = []
-        for skip, x in six.moves.zip(first_order_no_grads, xs):
+        errors = []
+        for i, (skip, x) in enumerate(six.moves.zip(first_order_no_grads, xs)):
             if skip:
                 if x.grad is not None:
-                    raise RuntimeError(
-                        'gradient of int variable must be None')
+                    errors.append(
+                        '[{}]: Gradient was calculated while expected to not.'
+                        .format(i))
             else:
                 if x.grad is None:
                     gxs.append(None)
                 else:
                     gxs.append(x.grad_var)
+
+        if len(errors) > 0:
+            f = six.StringIO()
+            f.write('There are errors retrieving first-order gradients:\n')
+            f.write('Inputs: {}\n'.format(utils._format_array_props(xs)))
+            f.write('Skip: {}\n'.format(
+                ', '.join(str(skip) for skip in first_order_no_grads)))
+            f.write('Errors:\n')
+            for error in errors:
+                f.write('{}\n'.format(error))
+            raise RuntimeError(f.getvalue())
 
         return tuple(gxs + [p.grad_var for p in params])
 
@@ -995,7 +1022,7 @@ def check_double_backward(func, x_data, y_grad, x_grad_grad, params=(),
             f.write('{}\n'.format(ggp_))
         f.write('\n')
         f.write(str(e))
-        raise AssertionError(f.getvalue())
+        utils._raise_from(AssertionError, f.getvalue(), e)
 
 
 class _GradientSetter(FunctionNode):

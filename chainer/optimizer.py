@@ -1,3 +1,4 @@
+from __future__ import absolute_import
 import collections
 import copy
 import warnings
@@ -14,6 +15,102 @@ from chainer import serializer as serializer_module
 from chainer import variable
 import chainerx
 
+import cupy
+
+
+class MyHook(chainer.function_hook.FunctionHook):
+    def __init__(self,stream1=None,eventfetch=None):
+        super(MyHook,self).__init__()
+        self.layerlist=[]
+        self.index=0
+        self.FB=0
+        self.l=0
+        self.nlayers=0
+        self.eventlist=[]
+        self.stream1=stream1
+        self.prefetchlist=[]
+        self.eventfetch=eventfetch
+    def forward_preprocess(self, func, in_data):
+#        print("Forward pre::::::::::::::::::::::::::::::")
+        if(self.FB==0 and self.nlayers!=0):
+            if(self.l>0):
+                self.eventlist[self.l].synchronize()
+            for i in in_data:
+                mem=i.data.mem
+                cupy.cuda.runtime.memPrefetchAsync(mem.ptr,mem.size,mem.device_id,self.stream1.ptr) 
+                self.stream1.synchronize()
+
+    def forward_postprocess(self, func, in_data):
+#        print("Forward post::::::::::::::::::::::::::::::")
+        if(self.FB==0 and self.nlayers==0):
+            self.layerlist.append(type(func))
+        else:
+            if(self.l<self.nlayers):
+                self.eventlist[self.l+1].record()
+                self.l=self.l+1    
+
+    def backward_preprocess(self, func, in_data, out_grad_data):
+#        print("Backward pre==============================================")
+        #self.prefetchlistold=self.prefetchlist
+        self.prefetchlist=[]
+        for o in func.get_retained_outputs():
+            #print(o.array.data.mem)
+            self.prefetchlist.append(o.array.data.mem)
+        for i in func.get_retained_inputs():
+            #print(i.array.data.mem)
+            self.prefetchlist.append(i.array.data.mem)
+
+        #cupy.cuda.stream.get_current_stream().synchronize()
+
+        #event[l+1] sync
+#        print("waiting for layer %i + 1 Bw"%self.l)
+        if(self.l<=self.nlayers):
+            self.eventlist[self.l].synchronize() #index in eventlist = layer# -1, here you need layer#l+1's event, index is l
+        #self.stream1.synchronize()
+
+        for mem in self.prefetchlist:
+#            print("prefetching:")
+#            print(mem,mem.ptr,cupy.cuda.memory._round_size(mem.size),mem.device_id,self.stream1.ptr)
+            cupy.cuda.runtime.memPrefetchAsync(mem.ptr,mem.size,mem.device_id,self.stream1.ptr)
+
+            self.stream1.synchronize()
+#            print("prefetch finished")
+        #self.eventfetch.record(self.stream1)
+        #cupy.cuda.stream.get_current_stream().wait_event(self.eventfetch)
+
+    def backward_postprocess(self, func, in_data, out_grad_data):
+#        print("Backward post=============================================")
+        #event[l] record in s0
+        
+        #for mem in self.prefetchlist:
+        #    cupy.cuda.runtime.memPrefetchAsync(mem.ptr,mem.size,-1,self.stream2.ptr)
+        #    cupy.cuda.runtime.memAdvise(mem.ptr, mem.size, 3, -1)
+#        for i in in_data:
+#            try:
+#                mem=i.data.mem
+#                cupy.cuda.runtime.memAdvise(mem.ptr, mem.size, 3, -1)
+#            cupy.cuda.runtime.memPrefetchAsync(mem.ptr,mem.size,-1,cupy.cuda.stream.get_current_stream().ptr)
+#            except:
+#                continue #print(type(i))
+        if(self.l>0):
+            self.eventlist[self.l-1].record()
+            self.l=self.l-1
+
+class MyfakeHook(chainer.function_hook.FunctionHook):
+    def __init__(self,stream1=None,eventfetch=None):
+        super(MyfakeHook,self).__init__()
+        self.layerlist=[]
+        self.index=0
+        self.FB=0
+        self.l=0
+        self.nlayers=0
+        self.eventlist=[]
+        self.stream1=stream1
+        self.prefetchlist=[]
+        self.eventfetch=eventfetch
+
+
+hook = MyHook()
 
 class Hyperparameter(object):
 
@@ -105,7 +202,7 @@ class UpdateRule(object):
 
     Attributes:
         enabled (bool): Flag to configure if this update rule is active. If the
-            update rule is not active (i.e., ``enabled = False``), the
+            update `rule is not active (i.e., ``enabled = False``), the
             :meth:`update` method does not update the parameter.
         hyperparam (Hyperparameter): Hyperparameter of the update rule.
         ~UpdateRule.t (int): Number of updates made by this update rule.
@@ -280,11 +377,7 @@ class UpdateRule(object):
         """
         grad_array = param.grad
         backend_name = param.array.device.backend.name
-        if backend_name == 'native':
-            update_core = self.update_core_cpu
-        elif backend_name == 'cuda':
-            update_core = self.update_core_gpu
-        else:
+        if backend_name not in ('native', 'cuda'):
             raise RuntimeError(
                 'Default implementation of Optimizer.update_core_chainerx is '
                 'only provided for native or cuda backends (actual: {}). '
@@ -316,7 +409,7 @@ class UpdateRule(object):
                 backend.from_chx(grad_array))
 
         # Update
-        update_core(temp_param)
+        self.update_core(temp_param)
 
         # Restore state arrays
         for state_name, (arr, fallback_arr) in chainerx_state_arrays.items():
@@ -409,7 +502,7 @@ class UpdateRule(object):
           3. copys the data of fp32 parameter variable to the data of original
              parameter variable, converting its data type from fp32 to fp16.
 
-        See meth:`update` for details.
+        See :meth:`update` for details.
         """
         self._use_fp32_update = flag
 
@@ -747,6 +840,10 @@ class GradientMethod(Optimizer):
         super(GradientMethod, self).__init__()
         self.hyperparam = Hyperparameter()
         self._use_fp32_update = False
+        self.stream1=cupy.cuda.stream.Stream(non_blocking=True)
+        self.eventlist=[]
+        self.eventfetch=cupy.cuda.stream.Event(block=True,disable_timing=True)
+        self.isfirst=0
 
     def setup(self, link):
         super(GradientMethod, self).setup(link)
@@ -798,15 +895,38 @@ class GradientMethod(Optimizer):
         parameter.
 
         """
-        if lossfun is not None:
-            use_cleargrads = getattr(self, '_use_cleargrads', True)
-            loss = lossfun(*args, **kwds)
-            if use_cleargrads:
-                self.target.cleargrads()
-            else:
-                self.target.zerograds()
-            loss.backward(loss_scale=self._loss_scale)
-            del loss
+        #print(self.eventlist)
+        #hook = MyfakeHook(self.stream1,self.eventfetch)
+        #if (self.is_1st_itor == 1):
+        if lossfun is None:
+            lossfun=self.target
+        #hook.stream1=self.stream1
+        with hook:
+            if lossfun is not None:
+                #print("ok")
+                use_cleargrads = getattr(self, '_use_cleargrads', True)
+                hook.FB=0
+                loss = lossfun(*args, **kwds)
+                if use_cleargrads:
+                    self.target.cleargrads()
+                else:
+                    self.target.zerograds()
+                if(self.isfirst==0):
+                    hook.nlayers=len(hook.layerlist)
+                    hook.stream1=self.stream1
+                    if (self.eventlist == []):
+                        for j in range(hook.nlayers+1):
+                            self.eventlist.append(cupy.cuda.stream.Event(block=True,disable_timing=True))
+                    hook.eventlist=self.eventlist
+                    #print(hook.eventlist)
+                    self.isfirst=1
+                hook.FB=1
+                hook.l=hook.nlayers
+       #         print(hook.eventlist)
+                hook.eventlist[-1].record()
+
+                loss.backward(loss_scale=self._loss_scale)
+                del loss
 
         self.reallocate_cleared_grads()
         self.check_nan_in_grads()

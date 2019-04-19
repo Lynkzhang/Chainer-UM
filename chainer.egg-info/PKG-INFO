@@ -1,6 +1,6 @@
 Metadata-Version: 2.1
 Name: chainer
-Version: 6.0.0b3
+Version: 6.0.0rc1
 Summary: A flexible framework of neural networks
 Home-page: https://chainer.org/
 Author: Seiya Tokui
@@ -103,8 +103,8 @@ Description: <div align="center"><img src="https://raw.githubusercontent.com/cha
         
 Platform: UNKNOWN
 Description-Content-Type: text/markdown
-Provides-Extra: appveyor
-Provides-Extra: test
-Provides-Extra: docs
-Provides-Extra: stylecheck
 Provides-Extra: doctest
+Provides-Extra: stylecheck
+Provides-Extra: appveyor
+Provides-Extra: docs
+Provides-Extra: test
